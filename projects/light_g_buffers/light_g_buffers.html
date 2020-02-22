@@ -1,4 +1,5 @@
-<meta charset="utf-8" emacsmode="-*- markdown -*-">
+<meta charset="utf-8" emacsmode="-*- markdown -*-"><link rel="stylesheet" href="https://casual-effects.com/markdeep/latest/dark.css?">
+
 
 **Efficiently Reconstruct Light Field Probes from Light-G-Buffers**
 
@@ -6,15 +7,19 @@
 
 <a href="https://dl.acm.org/doi/10.1145/3023368.3023378">[Mcguire2017]</a> 等人在传统基于探针的全局光照技术基础上，将场景几何信息编码进探针中，使基于着色器的世界空间光线追踪得以实现，且性能与现代屏幕空间光线追踪技术相差无几。他们的算法可以实现静态场景（静态光源）下的多次Diffuse和Glossy反射。但其中存在的问题较为明显：当场景发生变化后（物体移动或者光源位置、颜色或朝向发生变化），预计算的结果失效。此时如果仍使用预计算的结果进行全局光照计算，得到的结果自然是不正确的；同时，每一帧都进行光场探针数据更新也是不切实际的。
 
-本课题在<a href="https://dl.acm.org/doi/10.1145/3023368.3023378">[Mcguire2017]</a> 等人的工作基础上，结合Light-G-Buffer，在保持原算法效果和效率的基础上使之支持动态光源。课题主要贡献点如下：
+本项目在<a href="https://dl.acm.org/doi/10.1145/3023368.3023378">[Mcguire2017]</a> 等人的工作基础上，提出Light-G-Buffer，将原先探针处耦合的辐射照度/辐射亮度和几何信息解耦合，在保持原算法效果和效率的基础上使之支持动态光源。项目主要贡献点如下：
 
 - 提出Light-G-Buffer数据结构，实时更新这一数据结构，维持动态光源场景下<a href="https://dl.acm.org/doi/10.1145/3023368.3023378">[Mcguire2017]</a> 等人提出算法的效果和效率；
 - 基于Light-G-Buffer的快速光场探针重建算法；
 - 光源数较多情况下的启发式光源聚类策略。
 
-# 算法流程
+本项目采用开源引擎[[G3D](https://casual-effects.com/g3d/www/index.html)] 和C++实现。
 
-**Coming soon（暂未发表）**
+![Video](demo.mp4 width = "100%")
+
+# 主要流程
+
+![算法主要流程图](figures\pipeline.png)
 
 # 成果
 
