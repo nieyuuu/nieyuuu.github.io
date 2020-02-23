@@ -5,9 +5,68 @@
 
 # 项目简介
 
-# 主要流程
+当人群大量聚集场所发生突发公共安全事故时，如何有效快速安全地将所有人疏散是当前一个比较热门的研究领域。在此类特殊情况下，若单纯采用最短路径算法进行疏散路径规划，往往会导致人群在某些地方发生拥塞，更可能导致踩踏事故。早先基于与计算模拟进行路径优化的方式难以应对突发事件造成的影响。
+
+本项目基于智能摄像头捕获的人群动态分布信息，建立人群分布预测模型，对疏散路径进行动态调整，以避免疏散过程中可能发生的拥塞情况。同时，由于预测人群分布仅对较近将来时刻有效（即，场景中的动态不确定因素会导致对较远将来时刻的预测失效），且进行全局路径重归划的计算负担较重，因此本项目提出了分阶段动态规划的策略，使得算法实时性得到保证，且预测误差也得到纠正。
+
+本项目采用C++实现，结合OpenCV进行实验结果可视化，采用Google Test进行单元测试。
+
+![Video](demo.mp4 width = "100%")
+
+# 算法思路
+
+## 基本思想
+
+![基本思想](figures/basic_idea.png)
+
+如图所示，场景被抽象为双向图。其中，道路连接的交叉口处被定义为图的节点（A、B、C、D、E），每段道路被定义为图的边（AB、AE、AD等），疏散终点（T）也被定义成图的节点。
+
+首先，采用带权最短路径算法，以图的节点为单位，分别计算各个节点到达疏散终点的最短路径，形成树状结构。然后将人群分布到对应的有向边上，构成他们的初始路径。比如，图(a)中，对于单个个体$i$，规划的初始路径为（A-B-C-T）。
+
+当$i$移动至B（B被称为NTP，Next Target Point）时，分阶段重归划策略被激活。此时，由于人群分布预测模型的作用，若$i$继续沿原始路径疏散至C节点将会发生拥塞（图(b)中蓝色椭圆附近的人群也将移动至C），因此调整新的疏散路径为（B-D-T）。
+
+## 人群分布预测模型
+
+由于需要对将来某时刻的人群分布进行预测，本项目采用高斯模型对人群分布进行建模。同时，为了达到实时性要求，本项目只在道路交叉口进行一段时间内的建模。
+
+假定当前时刻为$\mathbf{t}$，同时，某个个体$i$预期到达下一个交叉口的时刻为$\mathbf{t_i'}$，则定义其到达下一个交叉口的时刻满足标准差为$\sigma_i$的高斯分布$\mathbb{G}(\mathbf{t_i'}, \sigma_i^2)$。$\sigma_i$的定义如下：
+$$
+\sigma_i = \frac{ln(\mathbf{t_i'} - \mathbf{t} + 1)}{3}
+$$
+由此可见，当$\mathbf{t_i'}$越接近$\mathbf{t}$，标准差越小（即，近的将来时刻预测得更为准确）。下图展示了在有8个人的情况下，到达A处的人群分布情况：
+
+![](figures/gaussian_distribution.png)
+
+因此，我们可以给出交叉口A处在将来某时刻的人群分布预测结果：
+$$
+\mathbf{CDF}(A, \mathbf{t}') = \sum_{i = 1} ^{8} \int_{\mathbf{t'} - \Delta} ^{\mathbf{t'} + \Delta} \mathbb{G}(\mathbf{t_i'}, \sigma_i^2) dt
+$$
+
+## 基于人群分布预测模型进行分阶段路径规划
+
+建立人群分布模型后，我们可以利用此模型对较近将来交叉口的拥塞情况做一定评估，并以此调整路径规划。当交叉口越拥塞，对疏散造成的负面影响越大。本项目重新设计路径规划的权重函数，将从当前节点$v_{cr}$到出口$T$的代价设计为两部分：
+$$
+t(v_{cr}, T, \mathbf{t}) = t_1(v_{cr}, v_{NTP}, \mathbf{t}) + t_2(v_{NTP}, T, \mathbf{t})
+$$
+
+$$
+t_{1}(v_{cr},v_{NTP},\mathbf{t})=\omega(\mathbf{CDF}(v_{cr},\mathbf{t}))\cdot\nonumber
+\tau(v_{cr},v_{NTP})
+$$
+
+$$
+t_{2}(v_{NTP}, T, \mathbf{t}) = \omega(\mathbf{CDF}(v_{NTP}, \mathbf{t}'))\cdot\nonumber
+\tau(v_{NTP}, T)
+$$
+
+其中$\omega()$代表将预测的人群分布映射到大于等于0的一个映射函数，$\nonumber
+\tau(v_1, v_2)$表示不考虑拥塞的情况下从$v_1$移动的$v_2$所需要的时间。
+
+当人群移动到交叉口时，根据上述人群分布模型进行路径重归划，使得实时动态响应，减少疏散过程中的拥塞发生概率成为可能。
 
 # 成果
+
+- **A Stage-wise Path Planning Approach for Crowd Evacuation in Buildings.** Xuechao Chen, Wenjing Li, <u>Yu Nie</u>, Rui Chen, Kangben He, Yanli Liu and Yanci Zhang *In Proceedings of the 32nd International Conference on Computer Animation and Social Agents (CASA’19).* [[Abstract](https://dl.acm.org/doi/10.1145/3328756.3328757)] [[Code](https://github.com/nieyuuu/CrowdEvacuation)] [[Pdf](casa19.pdf)] [[Video](demo.mp4)]
 
 
 
