@@ -17,7 +17,7 @@
 
 ## Efficiently Reconstruct Light Field Probes from Light G-Buffers
 
-光场探针技术是实时渲染领域用于生成全局光照效果的典型的预计算方法。<a href="https://dl.acm.org/doi/10.1145/3023368.3023378">[Mcguire2017]</a> 等人改进了传统辐射照度(*Irradiance*)和辐射亮度(*Radiance*)探针技术，在原有数据结构基础上进一步编码场景几何信息，使静态场景的多次Diffuse和Glossy全局光照效果得以实时生成。显然，其预计算的本质导致该算法在动态场景/光源的情况下，无法做到实时。本项目在<a href="https://dl.acm.org/doi/10.1145/3023368.3023378">[Mcguire2017]</a>等人工作的基础上，提出了基于Light G-Buffer的光场探针重建算法，在动态光源的情况下维持了原算法的效果及效率。
+光场探针技术是实时渲染领域用于生成全局光照效果的典型的预计算方法。[[McGuire](https://dl.acm.org/doi/10.1145/3023368.3023378)]等人改进了传统辐射照度(*Irradiance*)和辐射亮度(*Radiance*)探针技术，在原有数据结构基础上进一步编码场景几何信息，使静态场景的多次Diffuse和Glossy全局光照效果得以实时生成。显然，其预计算的本质导致该算法在动态场景/光源的情况下，无法做到实时。本项目在[[McGuire](https://dl.acm.org/doi/10.1145/3023368.3023378)]等人工作的基础上，提出了基于Light G-Buffer的光场探针重建算法，在动态光源的情况下维持了原算法的效果及效率。
 
 ![最终效果](projects/light_g_buffers/figures/complex_scenes.jpg)
 
