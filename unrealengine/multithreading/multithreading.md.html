@@ -1,0 +1,234 @@
+<meta charset="utf-8" emacsmode="-*- markdown -*-"><link rel="stylesheet" href="https://casual-effects.com/markdeep/latest/journal.css?">
+
+**Multithreading in Unreal Engine 5**
+
+多线程编程在现代软件工程中广泛应用，其主要目的是提高程序的性能。在游戏开发中，多线程编程也是一项重要技能和性能优化利器。然而，如若使用不当，多线程编程可能会导致诸如数据竞争、死锁、程序崩溃、程序Bug等问题。
+幸运的是，经过多年工程累积，虚幻5已经为开发者提供了很多**灵活便利**的编程接口和工具，使多线程编程变得更加容易。
+本文主要讲解了虚幻5中多线程的使用，并尝试理解相关实现。文章内容主要分为两个大的部分：通过示例代码讲解如何在UE5中使用多线程进行编程；以及通过分析源码尝试理解。
+如果你只希望了解如何使用相关接口，或者如何利用这些工具实现更为复杂的系统，可以直接查看示例代码部分。若希望了解底层实现，可以查看源码分析部分。
+
+再继续深入之前，请注意：
+
+1. 本文涉及到的内容主要基于UE5.5，且讨论内容有适当取舍，不会全部进行讲解分析；
+
+2. 文中列出的代码示例仅供参考，可能存在错误（编译错误或运行错误），还请读者自行验证，更为详细的示例代码请参考[[示例工程TODO](https://dl.acm.org/doi/10.1145/3328756.3328757)]；
+
+3. 在分析讨论源码实现方面，因本人专业知识有限，可能出现错误，还请批评指正。
+
+# 1 Multithreading Usecases in UE5[[示例工程TODO](https://dl.acm.org/doi/10.1145/3328756.3328757)]
+
+## 1.1 An Overview
+
+![总览](figures\overview.png width = "100%")
+
+从图中可以看到，UE5中多线程框架主要包含以下几个部分（并不是严格按照这种方式进行层级划分，这里只是大致示意，详情请看后文解释）：
+
+1. FRunnable和FRunnableThread作为最底层的接口类（虚基类），提供了UE5多线程的基础。它们往下承接了跟各个平台相关的具体线程实现方式(使用户不必纠结在不同平台上的兼容问题)；往上则承接了UE的其他系统，使其能创建并使用线程。
+
+2. 而各个平台的实际线程实现，则由其他派生类实现。如在Windows平台下是FRunnableThreadWin，也有基于PThread的FRunnableThreadPThread和基于Intel TBB的FTBBThread等。他们均派生自FRunnableThread，并依据各个平台的不同实现相应的功能（但一般不建议开发人员直接使用）。
+
+3. Low Level Task System作为UE5才有的低级任务系统，提供了更为灵活和高效的任务调度机制。它允许开发者创建和管理轻量级任务，并将其分配到不同的线程上执行。这个系统的设计目标是为了在多核处理器上最大化利用硬件资源，从而提升游戏性能。
+
+4. 更高层的任务系统，如Task Graph System和Task System，则提供了更为抽象和易用的接口。他们基于Low Level Task System构建，允许开发者定义任务之间的依赖关系，并自动处理任务的调度和执行。这些系统非常适合用于复杂的任务调度场景，如渲染、物理计算等，在引擎中有大量应用。
+
+5. Thread Pool则作为另一个高级接口，提供了线程池的功能，使得开发者可以方便地管理和重用线程。线程池通过预先创建一定数量的线程，并在需要时分配给任务使用，从而避免了频繁创建和销毁线程的开销。UE5中的线程池接口非常灵活，允许开发者根据需要调整线程池的大小和行为。 
+
+6. 最上层的接口，如Async Interface和ParallelFor Interface，提供了更为简洁和易用的多线程编程接口。Async Interface允许开发者轻松地创建异步任务，并在任务完成后执行回调函数。ParallelFor Interface则提供了并行执行循环的功能，使得开发者可以方便地将循环中的每个迭代分配到不同的线程上执行，从而提高执行效率。它们的实现依赖了底层的接口（详情请看后文解释）。
+
+这些系统相辅相成，组成了UE5灵活且强大的多线程编程框架，使开发者能够充分利用多核处理器的性能，提升游戏的运行效率和响应速度。
+
+注意：这些功能均位于Engine/Source/Runtime/Core模块下，在使用时需要包含Core模块。
+
+## 1.2 Async Interface
+
+Async接口位于Engine/Source/Runtime/Core/Public/Async/Async.h，主要包括：
+
+~~~ c++ linenumbers
+template< typename CallableType >
+auto Async(EAsyncExecution Execution, CallableType&& Callable, TUniqueFunction<void()> CompletionCallback = nullptr);
+
+template< typename CallableType >
+auto AsyncPool(FQueuedThreadPool& ThreadPool, CallableType&& Callable, TUniqueFunction<void()> CompletionCallback = nullptr, EQueuedWorkPriority InQueuedWorkPriority = EQueuedWorkPriority::Normal);
+
+template< typename CallableType >
+auto AsyncThread(CallableType&& Callable, uint32 StackSize = 0, EThreadPriority ThreadPri = TPri_Normal, TUniqueFunction<void()> CompletionCallback = nullptr);
+
+void AsyncTask(ENamedThreads::Type Thread, TUniqueFunction<void()> Function);
+~~~
+
+其中，枚举EAsyncExecution主要表明以何种底层实现进行异步执行调用。
+
+~~~ c++ linenumbers
+enum class EAsyncExecution
+{
+	TaskGraph,           //Execute on Task Graph System(for short running tasks). Task will be assigned to a worker thread to execute.
+	TaskGraphMainThread, //Execute on Task Graph System(for short running tasks). Task will be executed on the main thread(Game Thread).
+	Thread,              //Create a new thread to execute the task and then destroy the created thread(for long running tasks).
+	ThreadIfForkSafe,    //Create a new thread to execute the task and then destroy the created thread(for long running tasks).
+	ThreadPool,          //Execute on GThreadPool.
+#if WITH_EDITOR
+	LargeThreadPool      //Execute on GLargeThreadPool(only in editor mode).
+#endif
+};
+~~~
+
+而其他接口只是单独提出来，如AsyncPool等价于Async(EAsyncExecution::ThreadPool, ... ...)或者Async(EAsyncExecution::LargeThreadPool, ... ...)，AsyncThread等价于Async(EAsyncExecution::Thread, ... ...) 或者Async(EAsyncExecution::ThreadIfForkSafe, ... ...)，而AsyncTask则等价于Async(EAsyncExecution::TaskGraph, ... ...)或者Async(EAsyncExecution::TaskGraphMainThread, ... ...)。
+
+### 1.2.1 AsyncPool
+
+AsyncPool接口主要基于UE的线程池系统(FQueuedThreadPool)，允许开发者在指定的线程池上执行任务。线程池是一种预先创建一定数量的线程，并在需要时分配给任务使用的机制，可以避免频繁创建和销毁线程的开销。
+假定我们需要在线程池中执行某个任务，我们可以这样使用：
+
+~~~ c++ linenumbers
+//Task to execute
+auto DummyAsyncTask = []() -> int
+	{
+		// Do something
+		FPlatformProcess::Sleep(1.0f);
+		UE_LOG(LogTemp, Display, TEXT("Async Task Done!"));
+		return 100;
+	};
+
+//Execute the task in Thread Pool
+//The Thread Pool can be GThreadPool or GLargeThreadPool depending on which EAsyncExecution you pass to this method.
+//Both thread pools are defined in Engine/Source/Runtime/Core/Private/HAL/ThreadingBase.cpp and are created at Engine init time.
+auto Result = Async(EAsyncExecution::ThreadPool, DummyAsyncTask, []()
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling CompletionCallback!"));
+	});
+
+//Since the task is executed asynchronously(and we dont know when the execution will finish), we can do other work here
+while (!Result.IsReady())
+{
+	// Do some other work
+	FPlatformProcess::Sleep(0.1f);
+}
+
+//When the result is ready, we can get the return value of this execution.
+//If the result is not ready and you call Get() method, the caller will be blocked.
+int AsyncResult = Result.Get();
+
+//Alternatively you can use AsyncPool
+auto AnotherResult = AsyncPool(
+	*GThreadPool,                //Execute on GThreadPool
+	DummyAsyncTask,              //Task to execute
+	[]()                         //The CompletionCallback lambda
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling CompletionCallback!"));
+	},
+	EQueuedWorkPriority::High    //Execute with high priority
+);
+
+//Or you can create your own thread pool
+//Note: You should not use like this. this is just for demonstration purposes that you can create your own thread pool.
+FQueuedThreadPool* MyThreadPool = FQueuedThreadPool::Allocate();
+//Create the thread pool with 4 threads, 32KB stack size, normal priority and name it "MyThreadPool"
+MyThreadPool->Create(4, 32 * 1024, EThreadPriority::TPri_Normal, TEXT("MyThreadPool"));
+
+auto MyResult = AsyncPool(
+	*MyThreadPool,                //Execute on MyThreadPool
+	DummyAsyncTask,               //Task to execute
+	[]()                          //The CompletionCallback lambda
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling CompletionCallback!"));
+	},
+	EQueuedWorkPriority::High     //Execute with high priority
+);
+
+//Destroy the thread pool
+MyThreadPool->Destroy();
+~~~
+
+### 1.2.2 AsyncThread
+
+接下来，我们了解如何使用AsyncThread接口。AsyncThread接口会创建一个新的线程，执行完任务后销毁线程。因此，我们尽量不要在循环中调用AsyncThread接口，以免频繁创建和销毁线程。
+假定我们需要从网络下载资源，我们可以这样使用：
+
+~~~ c++ linenumbers
+//Task lambda
+const FString URL = TEXT("XXXXXXXXXXXX");
+auto NetworkDownloadingTask = [&URL]()
+	{
+		FPlatformProcess::Sleep(5.0f);
+		UE_LOG(LogTemp, Log, TEXT("Downloaded File From URL: %s"), *URL);
+		return FString{TEXT("Content from the downloaded file")};
+	};
+
+//Execute task asynchronously. This will create a new thread and after the task is completed, the thread will be destroyed.
+auto Result = AsyncThread(NetworkDownloadingTask, 32 * 1024, EThreadPriority::TPri_Normal);
+
+while (!Result.IsReady())
+{
+	// Since network downloading can be slow, we will wait for the task to complete by doing some other work.
+	// Here we are just sleeping for 5 seconds to simulate that.
+	FPlatformProcess::Sleep(5.0f);
+}
+
+FString AsyncResult = Result.Get();
+
+//The equivalent code is as follows:
+auto AnotherResult = Async(EAsyncExecution::Thread, NetworkDownloadingTask);
+~~~
+
+### 1.3.3 AsyncTask
+
+AsyncTask接口将异步任务转发给Task Graph System执行。Task Graph System是UE中的一个高级任务系统，它允许开发者定义任务之间的依赖关系（下图展示了一个通俗的例子），并自动处理任务的调度和执行。
+
+![任务与任务间形成依赖关系，最终组成一张有向无环图](figures\taskgraph1.png width = "100%")
+
+此外AsyncTask接口没有返回值，因此最好传递形如void Foo(void)类型的任务给它执行。如下所示：
+
+~~~ c++ linenumbers
+//Task to execute
+auto DummyAsyncTask = []()
+	{
+		// Do something
+		FPlatformProcess::Sleep(1.0f);
+		UE_LOG(LogTemp, Display, TEXT("Async Task Done!"));
+	};
+
+auto DummyAsyncTaskWithRetureValue = []()
+	{
+		// Do something
+		FPlatformProcess::Sleep(1.0f);
+		UE_LOG(LogTemp, Display, TEXT("Async Task Done!"));
+		return 100;
+	};
+
+//Execute the task on worker thread
+AsyncTask(ENamedThreads::AnyThread, DummyAsyncTask);
+//Execute the task on Named Thread(GameThread RenderThread or RHIThread)
+AsyncTask(ENamedThreads::GameThread, DummyAsyncTask);
+AsyncTask(ENamedThreads::ActualRenderingThread, DummyAsyncTask);
+AsyncTask(ENamedThreads::RHIThread, DummyAsyncTask);
+
+//Execute the task on worker thread and get the return value
+auto Result = Async(EAsyncExecution::TaskGraph, DummyAsyncTaskWithRetureValue);
+int ReturnValue = Result.Get();
+~~~
+
+## 1.3 ParallelFor Interface
+
+## 1.4 FRunnable and FRunnableThread
+
+## 1.5 FThread
+
+## 1.6 Thread Pool
+
+## 1.7 Low Level Task System
+
+## 1.8 Task System
+
+## 1.9 Task Graph System
+
+## 1.10 Summary
+
+# 2 Source Code Analysis
+
+TO BE CONTINUED...
+
+# [[Back to Home Page](../../index.md.html)]
+
+<style class="fallback">body{visibility:hidden}</style>
+<script>markdeepOptions={tocStyle:'long',tocMaxLevel:3};</script>
+<script src="https://casual-effects.com/markdeep/latest/markdeep.min.js?" charset="utf-8"></script>
