@@ -2,61 +2,1088 @@
 
 **Multithreading in Unreal Engine 5**
 
-多线程编程在现代软件工程中广泛应用，其主要目的是提高程序的性能。在游戏开发中，多线程编程也是一项重要技能和性能优化利器。然而，如若使用不当，多线程编程可能会导致诸如数据竞争、死锁、程序崩溃、程序Bug等问题。
-幸运的是，经过多年工程累积，虚幻5已经为开发者提供了很多**灵活便利**的编程接口和工具，使多线程编程变得更加容易。
-本文主要讲解了虚幻5中多线程的使用，并尝试理解相关实现。文章内容主要分为两个大的部分：通过示例代码讲解如何在UE5中使用多线程进行编程；以及通过分析源码尝试理解。
+多线程编程在现代软件工程中应用广泛，其主要目的是提高程序的性能或执行异步操作。在游戏开发中，多线程编程也是一项重要技能和性能优化利器。然而若使用不当，多线程编程可能会导致诸如数据竞争、死锁、程序崩溃、程序Bug等问题。
+幸运的是，经过多年工程积累，UE5已经为开发者提供了很多灵活便利的编程接口和工具，使多线程编程变得相对容易。
+本文主要讲解了UE5中多线程的使用，并尝试理解相关实现。文章内容分为两个大的部分：通过示例代码讲解如何在UE5中使用多线程进行编程；以及通过分析源码尝试理解其底层实现。
 如果你只希望了解如何使用相关接口，或者如何利用这些工具实现更为复杂的系统，可以直接查看示例代码部分。若希望了解底层实现，可以查看源码分析部分。
 
 再继续深入之前，请注意：
 
-1. 本文涉及到的内容主要基于UE5.5，且讨论内容有适当取舍，不会全部进行讲解分析；
+1. 本文涉及到的内容主要基于UE5.5，并且讨论内容有适当取舍，不会全部进行讲解分析；
+2. 文中列出的代码示例仅为了展示相关功能的使用方法，可能存在错误（编译错误或运行错误）或不合理之处，还请读者自行验证，更为详细的示例代码请参考[示例工程](https://github.com/nieyuuu/UEThreadingSample)；
+3. 因笔者专业知识有限，1.11章节的内容可能存在错误，请读者参阅其他资料，自行验证。
 
-2. 文中列出的代码示例仅供参考，可能存在错误（编译错误或运行错误），还请读者自行验证，更为详细的示例代码请参考[[示例工程TODO](https://dl.acm.org/doi/10.1145/3328756.3328757)]；
+# **1 Multithreading Use Cases in UE5**
 
-3. 在分析讨论源码实现方面，因本人专业知识有限，可能出现错误，还请批评指正。
+## **1.1 Overview**
 
-# 1 Multithreading Usecases in UE5[[示例工程TODO](https://dl.acm.org/doi/10.1145/3328756.3328757)]
+在开始之前，我们先用Visual Studio观察一下当程序启动后UE创建了哪些线程。下图展示了[示例工程](https://github.com/nieyuuu/UEThreadingSample)在Development模式（非Editor）下的线程情况：
 
-## 1.1 An Overview
+![Figure [Threads]:Threads in Unreal Engine](figures\threadsoverview.png)
 
-![总览](figures\overview.png width = "100%")
+总体来看，这些线程可以分为以下几类：
 
-从图中可以看到，UE5中多线程框架主要包含以下几个部分（并不是严格按照这种方式进行层级划分，这里只是大致示意，详情请看后文解释）：
+- GameThread：游戏线程（主线程）。最重要的线程之一，承担了引擎初始化、资源加卸载、游戏逻辑处理、引擎退出后进行资源清理等工作，是整个引擎的心脏。
+- RenderThread：渲染线程。用于处理渲染逻辑并生成相应的渲染命令（平台无关）以及向RHI（Render Hardware Interface）提交渲染命令等工作。
+- RHIThread：RHI线程。用于将渲染线程提交的命令“翻译”成对应平台的渲染调用（比如D3D、Vulkan、Metal或OpenGL ES等），并向GPU提交这些渲染调用。
+- WorkerThreads：由Low Level Task System创建的线程。主要分为前台（Foreground）工作线程和后台（Background）工作线程。用于处理经Task System、Task Graph System提交的任务。
+- ThreadPoolThreads：由线程池系统创建的线程。图中我们可以看到的线程池有IOThreadPool（专用于IO操作）、PSOPrecompileThreadPool（专用于处理PSO）以及BackgroundThreadPool（通用线程池，用以处理各类提交至GThreadPool的任务）。
+- OtherThreads：其他UE模块创建的线程。如音频相关的线程、AsyncLoading相关的线程、HTTP相关的线程等。
+- ThirdPartyThreads：第三方库创建的线程。如D3D创建的线程池、nVidia相关的线程（驱动程序相关?）以及XAudio相关的线程。
 
-1. FRunnable和FRunnableThread作为最底层的接口类（虚基类），提供了UE5多线程的基础。它们往下承接了跟各个平台相关的具体线程实现方式(使用户不必纠结在不同平台上的兼容问题)；往上则承接了UE的其他系统，使其能创建并使用线程。
+而在Task Graph System/Task System眼中，可将这些线程分为三大类：
 
-2. 而各个平台的实际线程实现，则由其他派生类实现。如在Windows平台下是FRunnableThreadWin，也有基于PThread的FRunnableThreadPThread和基于Intel TBB的FTBBThread等。他们均派生自FRunnableThread，并依据各个平台的不同实现相应的功能（但一般不建议开发人员直接使用）。
+- NamedThreads：具名线程。主要包括游戏线程、渲染线程和RHI线程。
+- AnyThreads：任意线程（工作线程）。包括由Low Level Task System创建的工作线程。
+- UnknownThreads：未知线程。除了上述线程的其他线程。
 
-3. Low Level Task System作为UE5才有的低级任务系统，提供了更为灵活和高效的任务调度机制。它允许开发者创建和管理轻量级任务，并将其分配到不同的线程上执行。这个系统的设计目标是为了在多核处理器上最大化利用硬件资源，从而提升游戏性能。
+接下来，我们从大方向上了解一下UE的多线程框架，如下图所示：
 
+![Figure [Threads]:System Overview](figures\overview.png)
+
+从图中可以看到，UE5中多线程框架主要包含以下几个部分（**并不是严格按照这种方式进行层级划分，这里只是大致示意**）：
+
+1. `FRunnable`和`FRunnableThread`作为底层的接口类（基类），提供了UE5多线程的基础功能。它们往下承接了各个平台相关的具体线程实现方式，使用户不必纠结在不同平台上的兼容问题和具体实现细节；往上则承接了UE的其他系统，使其能创建并使用线程。
+2. 各个平台的实际线程实现，则由其他派生类实现。如在Windows平台下是`FRunnableThreadWin`，也有基于PThread的`FRunnableThreadPThread`和基于Intel TBB的`FTBBThread`等。他们均派生自`FRunnableThread`，并依据各个平台的不同实现相应的功能，但一般不建议开发人员直接使用（UE是跨平台引擎，用户应使用平台无关的接口编写相关功能）。
+3. Low Level Task System则提供了更为灵活和高效的任务调度机制。它允许开发者创建和管理轻量级任务，并将其分配到不同的工作线程上执行。这个系统的设计目标是为了在多核处理器上最大化利用硬件资源和降低任务调度延迟，从而提升系统整体性能。
 4. 更高层的任务系统，如Task Graph System和Task System，则提供了更为抽象和易用的接口。他们基于Low Level Task System构建，允许开发者定义任务之间的依赖关系，并自动处理任务的调度和执行。这些系统非常适合用于复杂的任务调度场景，如渲染、物理计算等，在引擎中有大量应用。
-
 5. Thread Pool作为另一个高级接口，提供了线程池的功能，使得开发者可以方便地管理和重用线程。线程池通过预先创建一定数量的线程，并在需要时分配给任务使用，从而避免了频繁创建和销毁线程的开销。UE5中的线程池接口非常灵活，允许开发者根据需要调整线程池的大小和行为。 
-
 6. 最上层的接口，如Async Interface和ParallelFor Interface，提供了更为简洁和易用的多线程编程接口。Async Interface允许开发者轻松地创建异步任务，并在任务完成后执行回调函数。ParallelFor Interface则提供了并行执行循环的功能，使得开发者可以方便地将循环中的每个迭代分配到不同的线程上执行，从而提高执行效率。
 
-这些系统相辅相成，组成了UE5灵活且强大的多线程编程框架，使开发者能够充分利用多核处理器的性能，提升游戏的运行效率和响应速度。
+最后我们简单整理一下Low Level Task System、Task System和Task Graph System之间的关系。
 
-注意：这些功能均位于Engine/Source/Runtime/Core模块下，在使用时需要包含Core模块。
+Low Level Task System是UE5新开发的基于任务的多线程编程框架。它底层会创建若干工作线程，并通过调度器（Scheduler）将任务派发给工作线程执行，以及自动处理工作线程的休眠及唤醒情况。Task System则是对Task Graph System的改进。它以Low Level Task System为后端，并且提供了处理任务间依赖关系的功能，允许开发者编写复杂的任务调度应用。Task Graph System则是更早期的产物，它同样能处理任务的依赖关系，至于代码实现方面，现阶段已有较大改变。
 
-## 1.2 Async Interface
+- Task Graph New Frontend：由宏`TASKGRAPH_NEW_FRONTEND`控制Task Graph System的前端实现（默认为1）。若宏为1，则使用Task System作为Task Graph System的前端；若为0，则使用Task Graph System自己的前端。
+- Task Graph New Backend：在UE5.5之前，由全局变量`GUseNewTaskBackend`或在程序启动时传递`-TaskGraphForceOldBackend`或`-TaskGraphForceNewBackend`命令行参数控制是否启用。若使用新的后端实现，则Task Graph System将使用和Task System一样的后端（即Low Level Task System创建的工作线程和调度器）；否则将使用Task Graph System自己的后端（即Task Graph System自己创建的工作线程）。UE5.5已将Task Graph System自己的后端实现全部删除，仅使用Low Level Task System作为后端。
+
+!!! Tip
+    本文默认`TASKGRAPH_NEW_FRONTEND` = 1。因5.5版本以及删除了Task Graph System自己的后端实现，也相当于`TASKGRAPH_NEW_BACKEND` = 1。
+
+## **1.2 FRunnable and FRunnableThread**
+
+`FRunnable`和`FRunnableThread`是UE底层的线程使用方式之一（其二为`FThread`）。`FRunnable`作为基类，抽象表示一种“可运行”的对象，它本身并没有与线程相关的实现细节，而是将这些细节抽象到`FRunnableThread`中。
+`FRunnableThread`则是对线程对象的抽象，具体平台相关的线程实现交由其子类实现（如`FRunnableThreadWin`、`FRunnableThreadPThread`等）。
+
+`FRunnable`的定义如下（拷贝自Engine/Source/Runtime/Core/Public/HAL/Runnable.h）：
+
+~~~ c++ linenumbers
+class FRunnable
+{
+public:
+	/**
+	 * Initializes the runnable object.
+	 * This method is called in the context of the thread object that aggregates this, not the thread that passes this runnable to a new thread.
+	 * @return True if initialization was successful, false otherwise
+	 * @see Run, Stop, Exit
+	 */
+	virtual bool Init()
+	{
+		return true;
+	}
+
+	/**
+	 * Runs the runnable object.
+	 * This is where all per object thread work is done. This is only called if the initialization was successful.
+	 * @return The exit code of the runnable object
+	 * @see Init, Stop, Exit
+	 */
+	virtual uint32 Run() = 0;
+
+	/**
+	 * Stops the runnable object.
+	 * This is called if a thread is requested to terminate early.
+	 * @see Init, Run, Exit
+	 */
+	virtual void Stop() { }
+
+	/**
+	 * Exits the runnable object.
+	 * Called in the context of the aggregating thread to perform any cleanup.
+	 * @see Init, Run, Stop
+	 */
+	virtual void Exit() { }
+
+	/**
+	 * Gets single thread interface pointer used for ticking this runnable when multi-threading is disabled.
+	 * If the interface is not implemented, this runnable will not be ticked when FPlatformProcess::SupportsMultithreading() is false.
+	 * @return Pointer to the single thread interface or nullptr if not implemented.
+	 */
+	virtual class FSingleThreadRunnable* GetSingleThreadInterface( )
+	{
+		return nullptr;
+	}
+
+	/** Virtual destructor */
+	virtual ~FRunnable() { }
+};
+~~~
+
+可以看到`FRunnable`定义了“可运行”对象的执行过程：
+
+1. `Init`：从被创建的线程执行，用以初始化`FRunnable`对象；
+2. `Run`：从被创建的线程执行，执行具体的运行逻辑，实现需要的功能；
+3. `Stop`：可从其他线程调用以提前终止线程的执行；
+4. `Exit`：从被创建的线程执行，用于执行退出进行资源清理等操作；
+5. `GetSingleThreadInterface`：返回一个`FSingleThreadRunnable`指针，以执行`Tick`操作（当多线程被禁用或当前平台不支持多线程时）。
+
+各个平台的`FRunnableThread`子类已经由UE帮我们实现，我们仅需调用`FRunnableThread::Create`即可，UE会根据当前平台创建对应的`FRunnableThread`子类对象：
+
+~~~ c++ linenumbers
+//Implementing our runnable and overriding virtual functions according to specific requirements.
+class FMyRunnable :public FRunnable
+{
+public:
+	virtual bool Init() override
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling FMyRunnable::Init()."));
+		bIsRunning = true;
+		return true;
+	}
+
+	virtual uint32 Run() override
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling FMyRunnable::Run()."));
+		return 0;
+	}
+
+	virtual void Stop() override
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling FMyRunnable::Stop()."));
+	}
+
+	virtual void Exit() override
+	{
+		UE_LOG(LogTemp, Display, TEXT("Calling FMyRunnable::Exit()."));
+		bIsRunning = false;
+	}
+
+	virtual FSingleThreadRunnable* GetSingleThreadInterface()
+	{
+		return nullptr;
+	}
+
+	FMyRunnable() = default;
+
+	virtual ~FMyRunnable() = default;
+
+	bool IsRunning()const
+	{
+		return bIsRunning;
+	}
+
+private:
+	bool bIsRunning = false;
+};
+
+FMyRunnable* MyRunnable = new FMyRunnable();
+
+FRunnableThread* MyRunnableThread = FRunnableThread::Create(
+	MyRunnable,                  //Pass the created runnable object to this thread
+	TEXT("MyRunnableThread"),    //The thread name
+	0,                           //The thread stack size
+	EThreadPriority::TPri_Normal //The priority of created thread
+);
+
+//Wait until my runnable exits.
+while (MyRunnable->IsRunning())
+{
+	FPlatformProcess::Sleep(0.01f);
+}
+
+delete MyRunnableThread;
+MyRunnableThread = nullptr;
+delete MyRunnable;
+MyRunnable = nullptr;
+~~~
+
+`FRunnable`/`FRunnableThread`在引擎中有着广泛的应用。你可以在包括渲染线程、RHI线程以及众多其他引擎模块中发现它们的身影。
+
+~~~ c++ linenumbers
+//The rendering thread is actually a FRunnable object
+class FRenderingThread :public FRunnable
+{
+	// ... ...
+}
+~~~
+
+!!! Tip
+    线程的创建和销毁开销有一定开销，在使用时三思。
+
+## **1.3 FThread**
+
+`FThread`作为另一种线程使用方式，它纯粹抽象了线程这一概念（类似`std::thread`）。但一般不建议开发者直接使用（大部分情况下应当使用更高级的接口，如`FRunnable`、线程池、Task System或Task Graph System等）。其使用方式如下所示：
+
+~~~ c++ linenumbers
+//The threaded function that will be exectuted on other thread.
+auto ThreadedFunction = []() {
+	FTimespan Timespan = FTimespan::FromSeconds(0.05);
+	UE::FTimeout Timeout(Timespan);
+
+	while (!Timeout.IsExpired())
+	{
+		UE_LOG(LogTemp, Display, TEXT("Running My FThread Threaded Function."));
+		FPlatformProcess::Sleep(0.01);
+	}
+	};
+
+//The function that will be exectuted when multi threading is not supported or disabled.
+auto SingleThreadedTickFunction = []() {
+	UE_LOG(LogTemp, Display, TEXT("Running My FThread Single Threaded Tick Function."));
+	};
+
+TUniquePtr< FThread > Thread = MakeUnique< FThread >(
+	TEXT("My FThread"),//The debug name of this thread.
+	ThreadedFunction,
+	SingleThreadedTickFunction,
+	0,
+	EThreadPriority::TPri_Lowest//The thread priority of this thread.
+);
+
+//The caller thread may continue do some other work while the created FThread instance is processing its work.
+FTimespan Timespan = FTimespan::FromSeconds(0.05);
+UE::FTimeout Timeout(Timespan);
+while (!Timeout.IsExpired())
+{
+	UE_LOG(LogTemp, Display, TEXT("Caller is doing other work."));
+	FPlatformProcess::Sleep(0.01);
+}
+
+//Before destroy the created FThread instance, Join() must be called to wait for the FThread instance to finish execute.
+Thread->Join();
+
+Thread.Reset();
+~~~
+
+此外，通过源码我们不难发现`FThread`本身也是依靠`FRunnable`/`FRunnableThread`实现的：
+
+~~~ c++ linenumbers
+class FThreadImpl final : public FRunnable, public FSingleThreadRunnable
+{
+	// ... ...
+};
+
+class FThread final
+{
+	// ... ...
+private:
+	//The implementation
+	TSharedPtr< class FThreadImpl, ESPMode::ThreadSafe > Impl;
+};
+~~~
+
+!!! Tip
+    线程的创建和销毁开销有一定开销，在使用时三思。
+
+!!! WARNING
+    在销毁`FThread`线程实例前，一定记得调用`Join()`！！！
+
+## **1.4 Low Level Task System**
+
+Low Level Task System位于Engine/Source/Runtime/Core/[Public|Private]/Async/Fundamental文件夹中，是一套通用的基于任务的多线程编程框架，在引擎中主要作为Task System和Task Graph System的后端使用。
+
+要创建一个任务可以采用如下方式：
+
+~~~ c++ linenumbers
+TSharedPtr< LowLevelTasks::FTask > Task = MakeShared< LowLevelTasks::FTask >();
+
+//Init the task, it will be ready to be launched by the scheduler or executed.
+//Note that the task CAN BE reused(reinitialized) once it is completed!
+Task->Init(
+	TEXT("MyTask"), //Debug name
+	LowLevelTasks::ETaskPriority::Normal, //The priority of this task
+	[]() {}, //The task body lambda
+	LowLevelTasks::ETaskFlags::DefaultFlags //Flags of this task
+);
+~~~
+
+任务优先级通过枚举`ETaskPriority`指定，其定义如下所示：
+
+~~~ c++ linenumbers
+enum class ETaskPriority : int8
+{
+	High,                               //Foreground High Priority
+	Normal,                             //Foreground Normal Priority
+	Default = Normal,                   //Default Priority
+	ForegroundCount,
+	BackgroundHigh = ForegroundCount,   //Background High Priority
+	BackgroundNormal,                   //Background Normal Priority
+	BackgroundLow,                      //Background Low Priority
+	Count,
+	Inherit, //Inherit the TaskPriority from the launching Task(launching task inside another task) or the Default Priority if not launched from a Task.
+};
+~~~
+
+任务标志位通过枚举`ETaskFlags`指定，其定义为：
+
+~~~ c++ linenumbers
+enum class ETaskFlags : int8
+{
+	AllowNothing		= 0 << 0,
+	AllowBusyWaiting	= 1 << 0,
+	AllowCancellation	= 1 << 1,
+	AllowEverything		= AllowBusyWaiting | AllowCancellation,
+	DefaultFlags		= AllowEverything,
+};
+~~~
+
+任务创建结束后，即可通过Scheduler调度至合适的工作线程执行。同时我们也可以依据具体需求对任务进行相关操作：
+
+~~~ c++ linenumbers
+//Check if task is ready to be launched
+Task->IsReady();
+
+//If task has not been launched, execute the task immediately on this thread.
+Task->TryExecute();
+
+//Launch the task. The scheduler will assign this task to a worker thread.
+LowLevelTasks::TryLaunch(*Task, LowLevelTasks::EQueuePreference::DefaultPreference, false /* bWakeUpWorker */);
+
+//Try cancel/revive task
+Task->TryCancel();
+Task->TryRevive();
+
+//Try expedite task
+Task->TryExpedite();
+
+//Check if task is completed, can be:
+//1. Completed
+//2. Canceled and completed
+//3. Expedited and completed
+Task->IsCompleted();
+~~~
+
+Low Level Task System提供了一套基于任务的多线程编程框架，简单易用且灵活。但注意，这里的任务并不能像Task Graph System或Task System一样指定依赖关系，因此也不建议直接使用（**除非你确定需要这样做，或者你希望用它实现其他高级功能**）。
+另一方面，基于Low Level Task System，UE提供了能指定任务间依赖关系的Task System/Task Graph System，以此实现复杂的任务调度关系和其他高级功能特性。当然你也可以尝试借助Low Level Task System实现自己的功能系统（比如Game Play、或编辑器相关功能等）。
+
+## **1.5 Task Graph System**
+
+Task Graph System在引擎中有着广泛的应用（如执行Render Command、执行RHI Command、GC、物理模拟、骨骼动画更新等），它与引擎其他部分高度耦合。具体来说，任务被分为两类：
+
+- Named Thread Tasks：在具名线程中执行的任务，主要通过在NamedThread某些位置调用ProcessThreadUntilIdle和ProcessThreadUntilRequestReturn执行。
+- Any Thread Tasks：在工作线程中执行的任务，主要由Scheduler将任务分配至工作线程执行。
+
+任务之间的依赖关系可以理解成下图所示的形式：只有当任务的前置任务完成以后，该任务才能开始执行，最终任务与任务间的拓扑关系将形成一张有向无环图。
+
+![Figure [TaskGraph]:Task Graph DAG](figures\taskgraph1.png)
+
+### **1.5.1 Common Use Cases**
+
+#### **定义任务**
+
+定义任务的方式十分简单直接，仅需按如下方式定义任务类型即可（八股文式写法）：
+
+~~~ c++ linenumbers
+class FDummyTask
+{
+public:
+	//The constructor of task
+	//You can pass datas that will be used when task gets executed
+	FDummyTask(float InValue): SomeVariable(InValue)
+	{
+	}
+
+	//The stat related function which is used for analysis performance issues
+	TStatId GetStatId() const
+	{
+		RETURN_QUICK_DECLARE_CYCLE_STAT(FDummyTask, STATGROUP_TaskGraphTasks);
+	}
+
+	//This function defines which ENamedThread this task will be executed on
+	static ENamedThreads::Type GetDesiredThread()
+	{
+		return ENamedThreads::AnyBackgroundHiPriTask;
+	}
+
+	//This function defines how Task Graph System will treat task's subsequents
+	static ESubsequentsMode::Type GetSubsequentsMode()
+	{
+		return ESubsequentsMode::TrackSubsequents;
+	}
+
+	//The task body
+	void DoTask(ENamedThreads::Type CurrentThread, const FGraphEventRef& MyCompletionGraphEvent)
+	{
+		SomeVariable *= 100;
+	}
+
+private:
+	float SomeVariable = 0.5;
+};
+~~~
+
+`ESubsequentsMode`主要用以描述任务间的依赖关系，其定义如下：
+
+~~~ c++ linenumbers
+namespace ESubsequentsMode
+{
+	enum Type
+	{
+		/** Necessary when another task will depend on this task. */
+		TrackSubsequents,
+		/** Can be used to save task graph overhead when firing off a task that will not be a dependency of other tasks. */
+		FireAndForget
+	};
+}
+~~~
+
+#### **调度任务**
+
+当定义了我们的任务类型后，可以使用`TGraphTask`进行任务的创建和调度，如下（八股文式写法）：
+
+~~~ c++ linenumbers
+auto TaskConstructor = TGraphTask< FDummyTask >::CreateTask();
+auto MyTask = TaskConstructor.ConstructAndDispatchWhenReady(0.99f);
+
+//Construct and dispatch a task
+auto Task = TGraphTask< FDummyTask >::CreateTask().ConstructAndDispatchWhenReady(0.5f);
+
+//Construct and hold a task
+auto AnotherTask = TGraphTask< FDummyTask >::CreateTask().ConstructAndHold(2.7f);
+
+//Unlock the task
+AnotherTask->Unlock();
+~~~
+
+`TGraphTask`是一个模板类，模板参数需要指定我们定义的任务类型。当模板实例化后，我们可以通过静态方法`CreateTask`创建任务构造器（Task Constructor），然后通过构造器的`ConstructAndDispatchWhenReady`或`ConstructAndHold`构造任务实例，
+并把我们需要传递给任务实例的参数在`ConstructAndDispatchWhenReady`或`ConstructAndHold`中指定（一般情况下连起来写比较顺手）。两个方法的区别是，`ConstructAndDispatchWhenReady`会在任务创建完成后的合适时机（任务的所有前置任务完成执行后）自动开始执行。
+而`ConstructAndHold`不会自动执行，需要我们手动调用`Unlock`函数（但可能不会立即执行，同样需要满足任务的所有前置任务完成执行以后才会开始执行）。
+
+任务间的依赖关系在调用`CreateTask`方法时指定，如下所示：
+
+~~~ c++ linenumbers
+//Array of Prerequisites
+FGraphEventArray Prerequisites = {
+	TGraphTask< FDummyTask >::CreateTask().ConstructAndDispatchWhenReady(0.5f),
+	TGraphTask< FDummyTask >::CreateTask().ConstructAndDispatchWhenReady(1.5f)
+};
+
+//Pass Prerequisites as parameter of CreateTask
+auto TaskWithPrerequisite = TGraphTask< FDummyTask >::CreateTask(&Prerequisites).ConstructAndDispatchWhenReady(2.5f);
+
+//Wait for task to be completed
+TaskWithPrerequisite->Wait();
+~~~
+
+当`Prerequisites`数组中的所有任务都完成以后，`TaskWithPrerequisite`才会开始执行。任务之间如此组织，即可形成复杂的调度关系图，Task Graph System会自动处理任务间的依赖关系，用户不必关注其中的具体实现细节，十分便利。
+
+!!! WARNING
+    在组织任务间依赖关系时，一定不能形成环状结构！
+
+!!! WARNING
+    如果任务还没完成，调用`Wait`将阻塞当前线程！
+
+### **1.5.2 Process Named Thread Tasks**
+
+工作线程的任务将由Scheduler调度至对应的工作线程执行，那么具名线程的任务又是在何时被执行的呢？首先，我们可以手动处理具名线程的任务，以游戏线程为例，我们可以在游戏线程中调用`ProcessThreadUntilIdle`或者`ProcessThreadUntilRequestReturn`。如下所示：
+
+~~~ c++ linenumbers
+//Supposing we are in game thread and we dispatched a game thread task.
+auto GameThreadTask = FFunctionGraphTask::CreateAndDispatchWhenReady(
+	[]() {},
+	TStatId{},
+	nullptr,
+	ENamedThreads::GameThread
+);
+
+//process game thread tasks until idle.
+{
+	FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GameThread);
+}
+
+//Process game thread tasks until RequestReturn is called.
+{
+	FTaskGraphInterface::Get().ProcessThreadUntilRequestReturn(ENamedThreads::GameThread);
+
+	//Dispatch another task use Task Graph System
+	//This task takes GameThreadTask as its prerequisite
+	FGraphEventArray Prerequisites{ GameThreadTask };
+	TGraphTask< FReturnGraphTask >::CreateTask(&Prerequisites).ConstructAndDispatchWhenReady(ENamedThreads::GameThread);
+}
+
+//Wait here will not deadlock
+//1. If we process thread until idle.
+//2. Or if we process thread until explicitly request return.
+//3. Even if we dont perform the above operations, Wait() itself will help with that.
+GameThreadTask->Wait();
+~~~
+
+其次，在引擎的其他地方也有处理具名线程任务的调用（比如游戏线程会在每帧Tick时调用上述接口处理游戏线程相关的任务）。我们再以渲染线程为例：
+
+~~~ c++ linenumbers
+void RenderingThreadMain()
+{
+	//...
+	ENamedThreads::Type RenderThread = ENamedThreads::Type(ENamedThreads::ActualRenderingThread);
+	//...
+	//Will continually processing render thread tasks in render thread loop
+	FTaskGraphInterface::Get().ProcessThreadUntilRequestReturn(RenderThread);
+	//...
+}
+
+static void StopRenderingThread()
+{
+	//...
+	//When request stopping render thread, use the task graph interface to request stop processing render thread tasks
+	FGraphEventRef QuitTask = TGraphTask< FReturnGraphTask >::CreateTask(nullptr, ENamedThreads::GameThread).ConstructAndDispatchWhenReady(ENamedThreads::GetRenderThread());
+	//...
+}
+~~~
+
+可以看到，渲染线程其实也是通过Task Graph System的`ProcessThreadUntilRequestReturn`接口处理渲染线程相关的任务。而当引擎调用`StopRenderingThread`的时候会创建一个类型为`FReturnGraphTask`的任务，要求渲染线程返回。再比如RHI线程：
+
+~~~ c++ linenumbers
+class FRHIThread : private FRunnable
+{
+	FRunnableThread* Thread = nullptr;
+
+public:
+	FRHIThread()
+	{
+		//...
+		Thread = FRunnableThread::Create(
+			this,
+			TEXT("RHIThread"),
+			512 * 1024,
+			FPlatformAffinity::GetRHIThreadPriority(),
+			FPlatformAffinity::GetRHIThreadMask(),
+			FPlatformAffinity::GetRHIThreadFlags()
+		);
+		//...
+	}
+
+	~FRHIThread()
+	{
+		//...
+		TGraphTask< FReturnGraphTask >::CreateTask(nullptr, ENamedThreads::GameThread).ConstructAndDispatchWhenReady(ENamedThreads::RHIThread);
+		Thread->WaitForCompletion();
+		//...
+		delete Thread;
+	}
+
+	virtual uint32 Run() override
+	{
+		//...
+		FTaskGraphInterface::Get().ProcessThreadUntilRequestReturn(ENamedThreads::RHIThread);
+		//...
+		return 0;
+	}
+};
+~~~
+
+RHIThread派生自`FRunnable`，在其构造函数中，创建了`FRunnableThread`。而在`Run()`函数中调用TaskGraphInterface的接口处理任务，在其析构函数中要求RHI线程返回。
+
+## **1.6 Task System**
+
+Task System作为Task Graph System的继任者，已经开始慢慢取代Task Graph System在引擎中的角色（但Named Thread Tasks仍通过Task Graph System处理）。
+事实上，因为`TASKGRAPH_NEW_FRONTEND`的存在，现阶段Task Graph System和Task System的边界已经开始变得模糊起来。以下例子能最直观地展现这种变化：我们首先创建了一个Task Graph System任务，
+然后将这个任务作为前置依赖以创建另一个Task System任务。
+
+~~~ c++ linenumbers
+//This is a task graph system task
+auto GraphTask = FFunctionGraphTask::CreateAndDispatchWhenReady(
+	[]() {},
+	TStatId{},
+	nullptr,
+	ENamedThreads::AnyThread
+);
+
+//This is a task system task
+auto Task = UE::Tasks::Launch(
+	UE_SOURCE_LOCATION,
+	[]() {},
+	UE::Tasks::Prerequisites(GraphTask), //This task takes GraphTask as its prerequisite
+	LowLevelTasks::ETaskPriority::High,
+	UE::Tasks::EExtendedTaskPriority::None
+);
+~~~
+
+### **1.6.1 Common Use Cases**
+
+#### **启动任务与等待任务完成**
+
+~~~ c++ linenumbers
+//Launch a task
+auto TaskA = UE::Tasks::Launch(
+	UE_SOURCE_LOCATION,
+	[]() {}, //Task body
+	LowLevelTasks::ETaskPriority::Normal, //Low level task priority
+	UE::Tasks::EExtendedTaskPriority::None //extended task priority
+);
+
+//Launch another task
+auto TaskB = UE::Tasks::Launch(
+	UE_SOURCE_LOCATION,
+	[]() {}, //Task body
+	UE::Tasks::Prerequisites(TaskA), //The prerequisite of this task
+	LowLevelTasks::ETaskPriority::Normal, //Low level task priority
+	UE::Tasks::EExtendedTaskPriority::None //extended task priority
+);
+~~~
+
+此前说过Task System其实是拓展了Low Level Task System，因此在启动任务时，需要传递`LowLevelTasks::ETaskPriority`作为参数，指定任务的优先级。除此以外，还需要指定`UE::Tasks::EExtendedTaskPriority`指定任务拓展优先级，其定义如下所示：
+
+~~~ c++ linenumbers
+enum class EExtendedTaskPriority
+{
+	None,
+	Inline, // a task priority for "inline" task execution - a task is executed "inline" by the thread that unlocked it, w/o scheduling
+	TaskEvent, // a task priority used by task events, allows to shortcut task execution
+
+#if TASKGRAPH_NEW_FRONTEND
+	// for integration with named threads
+	GameThreadNormalPri,
+	GameThreadHiPri,
+	GameThreadNormalPriLocalQueue,
+	GameThreadHiPriLocalQueue,
+
+	RenderThreadNormalPri,
+	RenderThreadHiPri,
+	RenderThreadNormalPriLocalQueue,
+	RenderThreadHiPriLocalQueue,
+
+	RHIThreadNormalPri,
+	RHIThreadHiPri,
+	RHIThreadNormalPriLocalQueue,
+	RHIThreadHiPriLocalQueue,
+#endif
+
+	Count
+};
+~~~
+
+在任务拓展优先级中：
+
+1. `None`：无拓展，即以`ETaskPriority`为准；
+2. `Inline`：内联任务优先级，可以简单理解为启动任务后立即执行（不经由Scheduler调度至工作线程执行）；
+3. `TaskEvent`：Task Event专用的优先级；
+4. 由宏`TASKGRAPH_NEW_FRONTEND`包裹的优先级：为了支持Task Graph System的具名线程任务；
+
+任务间的依赖关系则通过`UE::Tasks::Prerequisites()`辅助函数，在启动任务时指定相应的先决条件。
+
+#### **等待任务完成**
+
+同Task Graph System一样，Task System也提供了等待任务完成的接口：
+
+~~~ c++ linenumbers
+//Check if task is completed
+TaskB.IsCompleted();
+
+//Wait will block caller thread until task is completed
+TaskB.Wait();
+//Wait will block caller thread until given timeout expired
+TaskB.Wait(FTimespan::FromMilliseconds(10));
+~~~
+
+### **1.6.2 Piped Tasks**
+
+管线化任务或管线，是一种非并发执行的任务链条（由有向无环图变为任务链）。假设我们在任务执行过程中访问共享资源，由于并发的特性需要对共享资源加以保护，比如通过互斥锁、临界区等（参见1.11.3）。这种情况下若加锁/解锁不当可能导致性能损失、竞争条件、死锁或其他严重问题。
+此时或许可以通过管线化任务来帮助我们简化资源访问的问题（任务之间的依赖关系依然生效）。
+
+![Figure [PipedTasks]:Piped Tasks](figures\pipedtasks.png)
+
+~~~ c++ linenumbers
+//Create a pipe
+TUniquePtr< FPipe > Pipe = MakeUnique< FPipe >(TEXT("Pipe"));
+
+//Launch task through pipe
+auto TaskA = Pipe->Launch(
+	UE_SOURCE_LOCATION,
+	[]() {},
+	ETaskPriority::Default,
+	EExtendedTaskPriority::None
+);
+
+auto TaskB = Pipe->Launch(
+	UE_SOURCE_LOCATION,
+	[]() {},
+	ETaskPriority::Default,
+	EExtendedTaskPriority::None
+);
+
+//Check if pipe has any incomplete tasks
+Pipe->HasWork();
+
+//Wait until pipe empty
+Pipe->WaitUntilEmpty(FTimespan::MaxValue());
+~~~
+
+### **1.6.3 Nested Tasks**
+
+嵌套任务类似于任务的先决条件，不过它定义的是任务的完成时机。举个例子来说，若任务A在执行时启动了另一个任务B，并将任务B作为自己的嵌套任务，那么任务A的完成情况取决于：
+
+1. 任务A自身是否完成；
+2. 假设任务A已完成，那么嵌套任务B是否完成。
+
+任务A与任务B本身仍然可能并发执行。当然也可以不使用嵌套任务，而采用在任务A的中等待任务B完成，但这样会阻塞任务A，因此不是一种优雅的实现方式。
+
+~~~ c++ linenumbers
+//Version of wait
+auto TaskA = Launch(
+	UE_SOURCE_LOCATION,
+	[]() {
+		auto TaskB = Launch(
+			UE_SOURCE_LOCATION,
+			[]() {},
+			ETaskPriority::Normal,
+			EExtendedTaskPriority::None
+		);
+
+		//Explicitly wait TaskB to be completed which will block TaskA if TaskB is not completed
+		TaskB.Wait();
+	},
+	ETaskPriority::Normal,
+	EExtendedTaskPriority::None
+	);
+
+//Version of nested task
+auto OuterTask = Launch(
+	UE_SOURCE_LOCATION,
+	[]() {
+		auto InnerTask = Launch(
+			UE_SOURCE_LOCATION,
+			[]() {},
+			ETaskPriority::Normal,
+			EExtendedTaskPriority::None
+		);
+
+		//Add InnerTask as the nested task of OuterTask
+		AddNested(InnerTask);
+	},
+	ETaskPriority::Normal,
+	EExtendedTaskPriority::None
+	);
+~~~
+
+### **1.6.4 Task Events**
+
+任务事件是一种特殊的任务类型（有点类似`FEvent`，但相较于`FEvent`更加轻量级，参见章节1.11.3），它本身并不执行任何操作，通常被用于任务同步。当创建任务事件后，事件将处于未激活状态（Not Signaled），需要在合适的时机触发事件（Trigger）。
+关于任务事件的具体操作如下所示：
+
+~~~ c++ linenumbers
+//Use task event as task holder just like CreateAndHold in Task Graph System
+FTaskEvent Event{ UE_SOURCE_LOCATION };
+
+//Launch a task
+auto Task = Launch(
+	UE_SOURCE_LOCATION,
+	[]() {},
+	Prerequisites(Event), //The event is a prerequisite of this task
+	ETaskPriority::Normal,
+	EExtendedTaskPriority::None
+);
+
+//The task will not be executed until we trigger(signal) the event
+Event.Trigger();
+
+//You can also use task event as task joiner
+auto TaskA = Launch(
+	UE_SOURCE_LOCATION,
+	[]() {},
+	ETaskPriority::Normal,
+	EExtendedTaskPriority::None
+);
+auto TaskB = Launch(
+	UE_SOURCE_LOCATION,
+	[]() {},
+	ETaskPriority::Normal,
+	EExtendedTaskPriority::None
+);
+
+FTaskEvent Joiner{ UE_SOURCE_LOCATION };
+//Adds tasks as the prerequisites of the joiner
+Joiner.AddPrerequisites(Prerequisites(TaskA, TaskB));
+//Trigger the joiner
+Joiner.Trigger();
+
+//Wait for the joiner means waiting for the prerequisites to be completed
+Joiner.Wait();
+~~~
+
+## **1.7 Thread Pool**
+
+Thread Pool（Queued Thread Pool）是UE提供的线程池实现。线程池中存在多个工作线程及多个任务队列，任务（`IQueuedWork`）由生产者线程生成并入队，工作线程作为消费者从任务队列中取出任务并执行，当任务队列为空时，
+工作线程将休眠并在有新任务时唤醒并继续执行新任务。
+
+### **1.7.1 IQueuedWork**
+
+`IQueuedWork`作为所有线程池任务的基类，其定义如下所示：
+
+~~~ c++ linenumbers
+class IQueuedWork
+{
+public:
+	//This is where the real thread work is done. All work that is done for this queued object should be done from within the call to this function.
+	virtual void DoThreadedWork() = 0;
+
+	//Tells the queued work that it is being abandoned so that it can do per object clean up as needed.
+	//This will only be called if it is being abandoned before completion.
+	//NOTE: This requires the object to delete itself using whatever heap it was allocated in.
+	virtual void Abandon() = 0;
+
+	//Returns any special work flags.
+	virtual EQueuedWorkFlags GetQueuedWorkFlags() const { return EQueuedWorkFlags::None; }
+
+	//Returns an approximation of the peak memory (in bytes) this task could require during it's execution.
+	virtual int64 GetRequiredMemory() const
+	{
+		return -1 /* Negative value means unknown */;
+	}
+
+	//Returns text to identify the Work, for debug/log purposes only
+	virtual const TCHAR * GetDebugName() const
+	{
+		return nullptr;
+	}
+
+public:
+
+	//Virtual destructor so that child implementations are guaranteed a chance to clean up any resources they allocated.
+	virtual ~IQueuedWork() { }
+};
+~~~
+
+在使用时，用户需要从`IQueuedWork`派生出自己的任务类，并（按需）重载`IQueuedWork`中的虚函数。比如：
+
+~~~ c++ linenumbers
+class FMyWork :public IQueuedWork
+{
+public:
+	virtual void DoThreadedWork()override
+	{
+		//Do something that you need to do
+		delete this;
+	}
+
+	virtual void Abandon()override
+	{
+		//Implement if your work can be abandoned
+	}
+
+	virtual EQueuedWorkFlags GetQueuedWorkFlags()const override
+	{
+		return EQueuedWorkFlags::None;
+	}
+
+	virtual int64 GetRequiredMemory()const override
+	{
+		return -1;
+	}
+
+	virtual const TCHAR* GetDebugName()const override
+	{
+		return TEXT("FMyWork");
+	}
+};
+~~~
+
+当工作类定义结束后，即可通过线程池执行了。UE预先为我们创建了几个全局线程池，在使用时根据自己的需求和任务的实际属性，将任务入队即可。
+
+~~~ c++ linenumbers
+/** The global thread pool */
+FQueuedThreadPool* GThreadPool = nullptr;
+
+FQueuedThreadPool* GIOThreadPool = nullptr;
+
+FQueuedThreadPool* GBackgroundPriorityThreadPool = nullptr;
+
+#if WITH_EDITOR
+FQueuedThreadPool* GLargeThreadPool = nullptr;
+#endif
+
+//Add our work to the global thread pool
+GThreadPool->AddQueuedWork(new FMyWork);
+~~~
+
+当然我们也能定义自己的线程池，专用于处理自己的任务：
+
+~~~ c++ linenumbers
+auto MyDedicateThreadPool = FQueuedThreadPool::Allocate();
+MyDedicateThreadPool->Create(
+	2,                            //Num of threads in this thread pool
+	32768,                        //Stack size of thread
+	EThreadPriority::TPri_Normal, //Thread priority of thread
+	TEXT("My Thread Pool")        //Debug name of thread pool threads
+);
+
+MyDedicateThreadPool->AddQueuedWork(new FMyWork);
+
+//Destroy the thread pool
+MyDedicateThreadPool->Destroy();
+delete MyDedicateThreadPool;
+~~~
+
+### **1.7.2 FAutoDeleteAsyncTask and FAsyncTask**
+
+在前面的例子中：
+
+1. 我们定义了`FMyWork`类；
+2. 在`AddQueuedWork`时，通过`new`在堆上为`FMyWork`实例分配内存；
+3. 在`DoThreadedWork`的末尾进行`delete this`释放堆上的内存。
+
+以此，我们保证了`FMyWork`实例的生命周期，且不需要需要手动释放堆上的内存空间。另一方面我们可以借助`FAutoDeleteAsyncTask`帮助我们自动进行内存管理：
+
+~~~ c++ linenumbers
+class FAutoDeleteWork :public FNonAbandonableTask
+{
+	//Declare FAutoDeleteAsyncTask< FAutoDeleteWork > as a friend so it can access the private members of this class.
+	friend class FAutoDeleteAsyncTask< FAutoDeleteWork >;
+private:
+	//Keep the constructor private to prevent user creating instances of this class(except for the friend class).
+	FAutoDeleteWork() = default;
+
+	//The threaded work to do
+	void DoWork()
+	{
+		//We use FAutoDeleteAsyncTask< WorkType > to delete work instance, so no need to delete ourself here.
+		//delete this;
+	}
+
+	//Declare stat id
+	FORCEINLINE TStatId GetStatId() const
+	{
+		RETURN_QUICK_DECLARE_CYCLE_STAT(FAutoDeleteAsyncTask, STATGROUP_ThreadPoolAsyncTasks);
+	}
+};
+~~~
+
+`FAutoDeleteAsyncTask`（以及`FAsyncTask`）派生自`IQueuedWork`，是一个模板类。我们可以将自定义工作类作为模板参数传递给它，随后交由某个线程池执行。
+
+~~~ c++ linenumbers
+template< typename TTask >
+class FAutoDeleteAsyncTask :private UE::FInheritedContextBase, private IQueuedWork
+{
+	// ... ...
+};
+
+FAutoDeleteAsyncTask< FAutoDeleteWork >* AutoDeleteWork = new FAutoDeleteAsyncTask< FAutoDeleteWork >;
+
+//Execute on the given thread pool. Note that its not safe to access work object after this call, since it might be auto deleted.
+AutoDeleteWork->StartBackgroundTask(GThreadPool, EQueuedWorkPriority::Normal);
+	
+//Or execute on current thread. Note that its not safe to access work object after this call, since it might be auto deleted.
+AutoDeleteWork->StartSynchronousTask();
+~~~
+
+`FAsyncTask`则提供了等待任务完成等其他高级接口供用户使用：
+
+~~~ c++ linenumbers
+class FSomeWork :public FNonAbandonableTask
+{
+	//Declare FAsyncTask< FSomeWork > as a friend.
+	friend class FAsyncTask< FSomeWork >;
+private:
+	FSomeWork() = default;
+
+	//The threaded work to do
+	void DoWork()
+	{
+		Result = 100;
+	}
+
+	//Declare stat id
+	FORCEINLINE TStatId GetStatId() const
+	{
+		RETURN_QUICK_DECLARE_CYCLE_STAT(FSomeWork, STATGROUP_ThreadPoolAsyncTasks);
+	}
+
+private:
+	int32 Result = -1;
+
+public:
+	//Interface for accessing result when work is done
+	const int32& GetResult()const
+	{
+		return Result;
+	}
+};
+
+FAsyncTask< FSomeWork >* Work = new FAsyncTask< FSomeWork >;
+
+//Execute on the given thread pool
+Work->StartBackgroundTask(GThreadPool, EQueuedWorkPriority::Normal);
+	
+//Or execute on current thread
+Work->StartSynchronousTask();
+	
+//Wait for completion or ensure completion
+Work->WaitCompletionWithTimeout(0.005f);
+Work->EnsureCompletion(false/* bDoWorkOnThisThreadIfNotStarted */, false/* bIsLatencySensitive */);
+	
+//Retrieve task result
+FSomeWork UserTask = Work->GetTask();
+auto Result = UserTask.GetResult();
+	
+//Delete the heap memory
+delete Work;
+~~~
+
+### **1.7.3 Thread Pool Wrappers**
+
+Thread Pool Wrapper顾名思义，是对线程池的又一层封装。UE5中提供了4类Thread Pool Wrapper，主要包括：
+
+1. 普通Wraper：可以限制最大并发数，可以动态暂停和恢复Wrapper的执行，以及动态调整添加到Wrapper中的任务的优先级。
+2. Dynamic Wrapper：可以限制最大并发数，可以动态暂停和恢复Wrapper的执行，以及对添加到Wrapper中的任务进行重排序。
+3. Task Graph Wrapper：将任务转发给Task Graph System的Wrapper。
+4. Low Level Task Wrapper：将任务转发给Low Level Task System的Wrapper。
+
+这些Wrapper主要用于编辑器环境，能很好地控制并发数量，降低系统负荷，把有限的资源腾挪给实时性要求更高的其他系统。
+
+~~~ c++ linenumbers
+//The priority mapper. Used to change the priority of the IQueuedWork instance.
+auto PriorityMapper = [](EQueuedWorkPriority InPriority) -> EQueuedWorkPriority
+	{
+		return EQueuedWorkPriority::Lowest;
+	};
+
+FQueuedThreadPoolWrapper* ThreadPoolWrapper = new FQueuedThreadPoolWrapper(GThreadPool, 1/* InMaxConcurrency */, PriorityMapper);
+
+ThreadPoolWrapper->Pause();
+
+ThreadPoolWrapper->AddQueuedWork(new FMyWork, EQueuedWorkPriority::Normal);
+
+ThreadPoolWrapper->Resume(-1);
+
+delete ThreadPoolWrapper;
+
+
+FQueuedThreadPoolDynamicWrapper* DynamicWrapper = new FQueuedThreadPoolDynamicWrapper(GThreadPool, 1/* InMaxConcurrency */, PriorityMapper);
+
+DynamicWrapper->Pause();
+
+DynamicWrapper->AddQueuedWork(new FMyWork, EQueuedWorkPriority::Normal);
+
+auto SortPredicate = [](const IQueuedWork* Lhs, const IQueuedWork* Rhs) -> bool
+{
+	return true;
+};
+
+//Sort the IQueuedWork instances currently submitted to this wrapper with the given sort predicate.
+DynamicWrapper->Sort(SortPredicate);
+
+DynamicWrapper->Resume(-1);
+
+delete DynamicWrapper;
+~~~
+
+## **1.8 Async Interfaces**
 
 Async接口位于Engine/Source/Runtime/Core/Public/Async/Async.h，主要包括：
 
 ~~~ c++ linenumbers
 template< typename CallableType >
-auto Async(EAsyncExecution Execution, CallableType&& Callable, TUniqueFunction<void()> CompletionCallback = nullptr);
+auto Async(EAsyncExecution Execution, CallableType&& Callable, TUniqueFunction< void() > CompletionCallback = nullptr);
 
 template< typename CallableType >
-auto AsyncPool(FQueuedThreadPool& ThreadPool, CallableType&& Callable, TUniqueFunction<void()> CompletionCallback = nullptr, EQueuedWorkPriority InQueuedWorkPriority = EQueuedWorkPriority::Normal);
+auto AsyncPool(FQueuedThreadPool& ThreadPool, CallableType&& Callable, TUniqueFunction< void() > CompletionCallback = nullptr, EQueuedWorkPriority InQueuedWorkPriority = EQueuedWorkPriority::Normal);
 
 template< typename CallableType >
-auto AsyncThread(CallableType&& Callable, uint32 StackSize = 0, EThreadPriority ThreadPri = TPri_Normal, TUniqueFunction<void()> CompletionCallback = nullptr);
+auto AsyncThread(CallableType&& Callable, uint32 StackSize = 0, EThreadPriority ThreadPri = TPri_Normal, TUniqueFunction< void() > CompletionCallback = nullptr);
 
-void AsyncTask(ENamedThreads::Type Thread, TUniqueFunction<void()> Function);
+void AsyncTask(ENamedThreads::Type Thread, TUniqueFunction< void() > Function);
 ~~~
 
-其中，枚举EAsyncExecution主要表明以何种底层实现进行异步执行调用。
+其中，枚举`EAsyncExecution`表明以何种底层实现进行异步执行调用。`Callable`表示需要执行的异步任务函数体，而`CompletionCallback`则表示任务结束后的回调函数（可选项）。
 
 ~~~ c++ linenumbers
 enum class EAsyncExecution
@@ -72,11 +1099,11 @@ enum class EAsyncExecution
 };
 ~~~
 
-而其他接口只是单独提出来，如AsyncPool等价于Async(EAsyncExecution::ThreadPool, ... ...)或者Async(EAsyncExecution::LargeThreadPool, ... ...)，AsyncThread等价于Async(EAsyncExecution::Thread, ... ...) 或者Async(EAsyncExecution::ThreadIfForkSafe, ... ...)，而AsyncTask则等价于Async(EAsyncExecution::TaskGraph, ... ...)或者Async(EAsyncExecution::TaskGraphMainThread, ... ...)。
+而其他接口只是单独提出来，如`AsyncPool`等价于`Async(EAsyncExecution::ThreadPool, ... ...)`或者`Async(EAsyncExecution::LargeThreadPool, ... ...)`；`AsyncThread`等价于`Async(EAsyncExecution::Thread, ... ...)`或者`Async(EAsyncExecution::ThreadIfForkSafe, ... ...)`；而`AsyncTask`则等价于`Async(EAsyncExecution::TaskGraph, ... ...)`或者Async`(EAsyncExecution::TaskGraphMainThread, ... ...)`。
 
-### 1.2.1 AsyncPool
+### **1.8.1 AsyncPool**
 
-AsyncPool接口主要基于UE的线程池系统(FQueuedThreadPool)，允许开发者在指定的线程池上执行任务。线程池是一种预先创建一定数量的线程，并在需要时分配给任务使用的机制，可以避免频繁创建和销毁线程的开销。
+`AsyncPool`接口主要基于UE的线程池系统(`FQueuedThreadPool`)，允许开发者在指定的线程池上执行任务。线程池是一种预先创建一定数量的线程，并在需要时分配给任务使用的机制，可以避免频繁创建和销毁线程的开销。
 假定我们需要在线程池中执行某个任务，我们可以这样使用：
 
 ~~~ c++ linenumbers
@@ -138,13 +1165,18 @@ auto MyResult = AsyncPool(
 	EQueuedWorkPriority::High     //Execute with high priority
 );
 
-//Destroy the thread pool
+//Destroy the thread pool(When the task is done).
+while(!MyResult.IsReady())
+{
+	FPlatformProcess::Sleep(0.1f);
+}
+
 MyThreadPool->Destroy();
 ~~~
 
-### 1.2.2 AsyncThread
+### **1.8.2 AsyncThread**
 
-接下来，我们了解如何使用AsyncThread接口。AsyncThread接口会创建一个新的线程，执行完任务后销毁线程。因此，我们尽量不要在循环中调用AsyncThread接口，以免频繁创建和销毁线程。
+接下来，我们了解如何使用`AsyncThread`接口。`AsyncThread`接口会创建一个新的线程，执行完任务后销毁线程。因此，我们尽量不要在循环中调用`AsyncThread`接口，以免频繁创建和销毁线程。
 假定我们需要从网络下载资源，我们可以这样使用：
 
 ~~~ c++ linenumbers
@@ -173,13 +1205,9 @@ FString AsyncResult = Result.Get();
 auto AnotherResult = Async(EAsyncExecution::Thread, NetworkDownloadingTask);
 ~~~
 
-### 1.2.3 AsyncTask
+### **1.8.3 AsyncTask**
 
-AsyncTask接口将异步任务转发给Task Graph System执行。Task Graph System是UE中的一个高级任务系统，它允许开发者定义任务之间的依赖关系（以下图为例），并自动处理任务的调度和执行。
-
-![任务与任务间形成依赖关系，最终组成一张有向无环图](figures\taskgraph1.png width = "100%")
-
-此外AsyncTask接口没有返回值，因此最好传递形如void Foo(void)类型的任务给它执行。如下所示：
+`AsyncTask`接口将异步任务转发给Task Graph System执行。此外`AsyncTask`接口没有返回值，因此最好传递形如`void Foo(void)`类型的任务给它执行。如下所示：
 
 ~~~ c++ linenumbers
 //Task to execute
@@ -210,9 +1238,9 @@ auto Result = Async(EAsyncExecution::TaskGraph, DummyAsyncTaskWithRetureValue);
 int ReturnValue = Result.Get();
 ~~~
 
-## 1.3 ParallelFor Interface
+## **1.9 ParallelFor Interfaces**
 
-ParallelFor顾名思义，是用于并行执行循环的接口。它允许开发者将循环分配到不同的线程上执行，从而提高执行效率。其接口定义位于Engine/Source/Runtime/Core/Public/Async/ParallelFor.h，主要包括：
+`ParallelFor`顾名思义，是用于并行执行循环的接口。它允许开发者将循环分配到不同的线程上执行（实际是将For循环划分成若干个批次后转发给Low Level Task System的工作线程执行），从而提高执行效率。其接口定义主要包括：
 
 ~~~ c++ linenumbers
 //There are different overloads of ParallelFor for different use cases.
@@ -221,19 +1249,130 @@ void ParallelFor(...);
 //Versions of ParallelFor with suffixes in the interface name.
 //These suffixes are as follows:
 //WithPreWork: Allows you to execute some initialization code before the loop starts.
-//WithTaskContext: Allows you to pass a task context to the loop body.
-//ExistingTaskContext: Allows you to use an existing task context.
+//WithTaskContext: Allows task contexts to the loop body.
+//WithExistingTaskContext: Allows you to use existing task contexts(pre-created).
 //An example will be like this:
-void ParallelForWithPreWork(const TCHAR* DebugName, int32 Num, int32 MinBatchSize, TFunctionRef<void(int32)> Body, TFunctionRef<void()> CurrentThreadWorkToDoBeforeHelping, EParallelForFlags Flags = EParallelForFlags::None);
+void ParallelForWithPreWork(const TCHAR* DebugName, int32 Num, int32 MinBatchSize, TFunctionRef< void(int32) > Body, TFunctionRef< void() > CurrentThreadWorkToDoBeforeHelping, EParallelForFlags Flags = EParallelForFlags::None);
 ~~~
 
-同时，ParallelFor接口还提供了一些标志位，用于控制并行执行的行为。如下所示：
+其用法如下所示：
 
 ~~~ c++ linenumbers
-// Flags controlling the ParallelFor's behavior.
+//The most common usage.
+auto LoopBody = [](int32 Index)
+	{
+		UE_LOG(LogTemp, Display, TEXT("Current loop index: %d."), Index);
+	};
+
+ParallelFor(
+	TEXT("ParallelFor Test"),
+	100, //Loop for 100 times.
+	10,  //Minimal batch size is 10
+	LoopBody,
+	EParallelForFlags::None
+);
+
+//The PreWork
+//Used to init someting(ie. allocate memory that will be used in loop body).
+TArray< int32 > IntArray;
+const int LoopNum = 100;
+
+auto PreWork = [&IntArray, LoopNum]()
+	{
+		UE_LOG(LogTemp, Display, TEXT("Executing pre work."));
+		IntArray.AddUninitialized(LoopNum);
+	};
+
+auto LoopBodyWithPrework = [&IntArray](int32 Index)
+	{
+		UE_LOG(LogTemp, Display, TEXT("Current loop index: %d."), Index);
+		IntArray[Index] = Index;
+	};
+
+ParallelForWithPreWork(
+	TEXT("ParallelFor Test"),
+	LoopNum,
+	10,
+	LoopBodyWithPrework,
+	PreWork,
+	EParallelForFlags::None
+);
+
+/* The Context */
+
+//The context definition. The default constructor is marked as deleted.
+struct FContext
+{
+	FContext(int32 Index)
+	{
+		ContextIndex = Index;
+	}
+
+	FContext() = delete;
+
+	int32 ContextIndex;
+};
+
+//The context constructor
+auto ContextConstructor = [](int32 ContextIndex, int32 NumContexts)
+	{
+		return FContext(ContextIndex);
+	};
+
+auto LoopBodyWithTaskContext_WithoutDefaultConstructor = [](FContext& Context, int32 Index)
+	{
+		UE_LOG(LogTemp, Display, TEXT("Current context index:%d. Current loop index: %d."), Context.ContextIndex, Index);
+	};
+
+TArray< FContext > ContextsWithoutDefaultConstructor;
+
+ParallelForWithTaskContext(
+	TEXT("ParallelForWithContext Test"),
+	ContextsWithoutDefaultConstructor,
+	100,
+	10,
+	ContextConstructor,
+	LoopBodyWithTaskContext_WithoutDefaultConstructor,
+	EParallelForFlags::None
+);
+
+//The context definition with default constructor.
+struct FContextWithDefaultConstructor
+{
+	FContextWithDefaultConstructor(int32 Index)
+	{
+		ContextIndex = Index;
+	}
+
+	FContextWithDefaultConstructor() = default;
+
+	int32 ContextIndex;
+};
+
+auto LoopBodyWithTaskContext_WithDefaultConstructor = [](FContextWithDefaultConstructor& Context, int32 Index)
+	{
+		//Note that the context is default constructed, so the context index might not be as expected.
+		UE_LOG(LogTemp, Display, TEXT("Current context(Default Constructed) index:%d. Current loop index: %d."), Context.ContextIndex, Index);
+	};
+
+TArray< FContextWithDefaultConstructor > ContextsWithDefaultConstructor;
+
+ParallelForWithTaskContext(
+	ContextsWithDefaultConstructor,
+	100,
+	LoopBodyWithTaskContext_WithDefaultConstructor
+);
+
+//When ParallelFor returned, we can process the contexts which is created within ParallelFor.
+~~~
+
+`ParallelFor`接口还提供了一些标志位，用于控制并行执行的行为。如下所示：
+
+~~~ c++ linenumbers
+//Flags controlling the ParallelFor's behavior.
 enum class EParallelForFlags
 {
-	// Default behavior
+	//Default behavior
 	None,
 
 	//Mostly used for testing, when used, ParallelFor will run single threaded instead.
@@ -243,33 +1382,203 @@ enum class EParallelForFlags
 	//This should be used for tasks with highly variable computational time.
 	Unbalanced = 2,
 
-	// if running on the rendering thread, make sure the ProcessThread is called when idle
+	//If running on the rendering thread, make sure the ProcessThread is called when idle
+	//ie. Calling
+	//FTaskGraphInterface::Get().ProcessThreadUntilIdle(ENamedThreads::GetRenderThread_Local());
 	PumpRenderingThread = 4,
 
-	// tasks should run on background priority threads
+	//Tasks should run on background priority threads
 	BackgroundPriority = 8,
 };
 ~~~
 
-## 1.4 FRunnable and FRunnableThread
+`ForceSingleThread`将强制单线程执行`ParallelFor`，主要用于调试。`UnBalanced`主要用于循环体的执行时间变化很大的情况，可用作负载均衡使用（比如，某些循环执行需要1ms，而其他循环执行需要100ms）。
+`PumpRenderingThread`主要用于在渲染线程调用ParallelFor时，调用Task Graph的接口处理渲染线程的Task Graph任务。`BackgroundPriority`表明应当在`Background`优先级的工作线程执行`ParallelFor`的并行任务。
 
-## 1.5 FThread
+关于`ParallelFor`的执行过程，可以参考下图（实际代码实现上可能存在差异，但大致是这样的）：
 
-## 1.6 Thread Pool
+![Figure [ParallelFor]:Parallel For](figures\parallelfor.png)
 
-## 1.7 Low Level Task System
+## **1.10 Other Topics**
 
-## 1.8 Task System
+### **1.10.1 Delegates in Unreal Engine**
 
-## 1.9 Task Graph System
+Delegate（委托）常用于异步编程系统。不同于C#等其他高级语言具有原生委托支持，UE依靠C++实现了一套自己的委托系统。其中主要分为4类：
 
-## 1.10 Summary
+1. 单播委托。通常使用宏`DECLARE_DELEGATE`及其变体声明。
+2. 多播委托。通常使用宏`DECLARE_MULTICAST_DELEGATE`及其变体声明。
+3. 动态单播委托。通常使用宏`DECLARE_DYNAMIC_DELEGATE`及其变体声明。
+4. 动态多播委托。通常使用宏`DECLARE_DYNAMIC_MULTICAST_DELEGATE`及其变体声明。
 
-# 2 Source Code Analysis
+讲透委托这一块需要大量篇幅且笔者对其了解有限，因此在此不多做赘述。有兴趣的读者可以参考UE官方文档或其他资料。另在实例工程中有一个关于委托的简单示例可供参考。
+
+### **1.10.2 Customize Async Blueprint Nodes**
+
+在UE蓝图中有许多异步节点（这些节点右上角带有一个时钟图标），比如`Delay`、`AsyncLoadAsset`、`AsyncLoadGameFromSlot`、`AsyncSaveGameToSlot`等，他们都是通过C++实现并封装成蓝图节点供用户使用。那么我们如何自定义一个异步蓝图节点呢？这里我们主要了解两类：
+
+1. 在编辑器模式下（仅在编辑器中能使用）：通过派生自`UK2Node_BaseAsyncTask`定义自己的蓝图节点，通过代理类实现异步功能。
+2. 在Runtime模式下（编辑器和打包后都能使用）：通过派生自`UBlueprintAsyncActionBase`定义并实现自己的异步蓝图节点。
+
+有关内容可参阅示例工程，分别对上述两种情况进行了展示。
+
+### **1.10.3 Promise and Future**
+
+Promise（承诺）和Future（未来）是一种异步编程模型（参考`std::promise`和`std::future`），用于封装异步操作的返回结果。UE没有采用C++标准库提供的实现，而是自己造轮子实现了Promise Future模型。相关内容
+位于：Engine/Source/Runtime/Core/Public/Async/Future.h中。其简单用法如下：
+
+~~~ c++ linenumbers
+//Define the promise which takes the type you want to reture as the template argument.
+TPromise< int32 > Promise;
+//Get the future of the promise.
+TFuture< int32 > Future = Promise.GetFuture();
+
+//Define the async function which will set the promise value.
+auto AsyncFunction = [LocalPromise = MoveTemp(Promise)]()mutable {
+	LocalPromise.SetValue(100);
+	};
+
+//Run our async function.
+Async(EAsyncExecution::TaskGraph, AsyncFunction);
+
+//Check if the future is ready.
+Future.IsReady();
+
+//Directly get the future result. Note this will block the caller thread if the future is not ready .
+int32 Result = Future.Get();
+~~~
+
+使用Promise和Future可以很方便地从不同的线程返回异步结果，简化了异步编程的复杂程度。再回看前面的Async接口，我们可以发现其实现原理就是基于Promise和Future。
+
+~~~ c++ linenumbers
+template< typename CallableType >
+auto Async(... , CallableType&& Callable, ... ) -> TFuture< decltype(Forward< CallableType >(Callable)()) >
+~~~
+
+Async返回一个`TFuture< decltype(Forward< CallableType >(Callable)()) >`类型的对象，`TFuture`的模板参数即为Labmda表达式的返回值类型（通过编译器自动推导得到）。
+
+## **1.11 Advanced Topics**
+
+### **1.11.1 Safe Resource Accessing**
+
+在多线程编程中，共享资源的安全访问是一项重要议题。在UE5中，我们至少需要注意以下两点：
+
+1. 某些资源只能在特定的线程访问，比如`UObject`只能在主线程访问，`FRenderResource`只能在渲染线程访问。我们在操作这些资源时需要注意线程安全问题；
+2. UE提供了许多辅助函数，帮助我们判断当前线程的属性，比如`IsInGameThread()`判断当前线程是否是主线程、`IsInRenderingThread()`判断当前线程是否是渲染线程等。
+
+有关内容读者可参考网上的其他资料或UE官方文档，在实践中逐步累积经验，在此就不多做赘述了。
+
+### **1.11.2 Profiling and Debugging**
+
+在编写代码时，我们难免会遇到Bug和性能问题，这时我们需要借助Profiler和Debug工具来帮助我们定位问题。
+
+- Profileing：我们可以在编写代码中插入统计数据相关的代码，并借助Profiler工具来分析性能问题：如Unreal Insights、Stat命令、Trace命令等。Profiler工具可以帮助我们分析CPU和GPU的性能瓶颈，找出性能问题的根源。
+- Debugging：我们可以使用Visual Studio等IDE的调试工具来帮助我们调试代码，设置断点、单步执行、查看变量值等。关于调试这块更多的是IDE的使用技巧，以及常年累月的经验积累。
+
+关于此部分内容，读者可以参考UE官方文档以及网络上的其他资料，更重要的是实战演练，多积累经验。
+
+### **1.11.3 Synchronization Primitives**
+
+Synchronization Primitives（同步原语）是用于控制并发/多线程编程中多个线程或进程之间的访问顺序，确保共享资源安全访问的一组机制或工具，他们的存在可以帮助程序员更好地管理线程间的协作关系、控制共享资源的安全访问。其类型主要包括：
+
+1. 临界区（Critical Section）。
+2. 互斥锁（Mutex）。
+3. 读写锁（Read-Write Lock）。
+4. 自旋锁（Spin Lock）。
+5. 条件变量（Conditional Variable）。
+6. 信号量（Semaphore）。
+7. 事件（Event）。
+8. 屏障（Barrier）。
+
+关于同步原语的讲解需要大量篇幅，本文不会做深入展开讨论，感兴趣的读者可以参考其他相关资料。另在示例工程中有若干关于同步原语的使用示例可供参考。
+
+### **1.11.4 Atomic Types and Memory Order**
+
+Atomic Types（原子类型，自C++11起）是一种特殊的数据类型，用于多线程编程中对共享资源进行原子操作。原子操作是指不可分割的操作，即在执行过程中不会被其他线程中断。原子类型的操作是线程安全的，不需要额外的同步机制（如互斥锁、信号量等）来保护共享资源。
+
+思考如下操作（对普通变量进行自增）：
+
+~~~ c++ linenumbers
+int32 Counter = 0;	
+Counter++;
+~~~
+
+在我们对Couter进行自增操作时，实际上是分为三步进行的：
+
+1. 读取Counter的值；
+2. 将Counter的值加1；
+3. 将新值写回Counter。
+
+此时考虑两个线程同时对Counter进行自增操作，可能会出现如下情况：
+
+1. 线程A首先读取Counter的值，此时因操作系统的调度，线程A休眠；
+2. 线程B读取Counter的值；
+3. 线程B对读取的值加1；
+4. 线程B将新值写回Counter；
+5. 线程A被操作系统唤醒并继续执行加1操作；
+6. 线程A将新值写回Counter。
+
+由于没有对Counter加以保护，上述情况执行完以后Counter的值为1，而非我们预期的2。若采用原子类型，则可以避免上述情况的发生。
+
+~~~ c++ linenumbers
+std::atomic< int32 > Counter = 0;
+Counter.fetch_add(1, std::memory_order_seq_cst); //With sequential consistency memory order
+~~~
+
+另外，在操作原子类型时，还可以提供一个额外的内存顺序参数（当不指定时，默认采用顺序一致性内存顺序）：
+
+~~~ c++ linenumbers
+enum class memory_order : int
+{
+    relaxed,
+    consume, //Usually not used
+    acquire,
+    release,
+    acq_rel,
+    seq_cst,
+
+    memory_order_relaxed = relaxed,
+    memory_order_consume = consume, //Usually not used
+    memory_order_acquire = acquire,
+    memory_order_release = release,
+    memory_order_acq_rel = acq_rel,
+    memory_order_seq_cst = seq_cst
+};
+
+inline constexpr memory_order memory_order_relaxed = memory_order::relaxed;
+inline constexpr memory_order memory_order_consume = memory_order::consume; //Usually not used
+inline constexpr memory_order memory_order_acquire = memory_order::acquire;
+inline constexpr memory_order memory_order_release = memory_order::release;
+inline constexpr memory_order memory_order_acq_rel = memory_order::acq_rel;
+inline constexpr memory_order memory_order_seq_cst = memory_order::seq_cst;
+~~~
+
+这里我们主要了解两种内存顺序：
+
+1. Relaxed Memory Order：松散内存顺序，是最弱的内存顺序，不保证任何内存顺序，仅保证原子操作本身的原子性（性能最优）。
+1. Sequential Consistency Memory Order：顺序一致性内存顺序，是最强的内存顺序，保证所有线程对原子变量的操作都是顺序一致的(性能最差)。
+
+要完全掌握内存顺序需要大量专业知识（处理器指令重排、编译器优化等），本文不会进行深入讲解，有关内容请读者参阅其他资料。建议在涉及到内存顺序时采用顺序一致性内存顺序，保证代码的正确性以避免潜在问题，当性能问题开始凸显时，再考虑其他内存顺序。
+
+## **1.12 Summary**
+
+本文主要介绍了在UE5中使用多线程编程的各种编程接口：
+
+1. 我们首先了解了UE在运行时创建的各种线程，并从大局观上了解了各类多线程编程系统以及它们之间的关系； 
+2. 我们随后了解了FRunnable和FRunnableThread、FThread、Low Level Task System、Task Graph System、Task System、Thread Pool、Async Interfaces以及ParallelFor Interfaces，并通过示例代码展示了如何使用这些接口，帮助开发者更好地理解和应用这些多线程编程技术；
+3. 然后我们介绍了UE代理、如何自定义异步蓝图节点以及Promise和Future的使用，帮助开发者更好地理解UE异步编程系统；
+4. 最后，我们还介绍了一些高级主题，如同步原语、原子类型和内存顺序等，进一步拓展了读者的知识面。
+
+编写又好又快的多线程代码并不容易，希望本文能起到抛砖引玉的作用，引领各位读者撬开多线程编程的大门。最后，简单介绍一下我认为的学习路线：
+
+1. 了解多线程编程的基本概念和原理，如进程、线程、上下文切换、死锁、饥饿、同步原语；以及了解C++中的各类基础知识，如内存管理、指针、引用、Lambda表达式等；
+2. 通过官方文档或网络博客等，了解UE5中的线程模型（GameThread、RenderThread以及RHIThread），以及它们之间如何进行交互；
+3. 通过其他资料或本文，了解UE5提供的各类编程接口/工具，并尝试编码实践；
+4. 理解线程间的同步机制，以做到访问共享资源的安全性；
+5. 更多高阶知识，如内存顺序、原子类型、内存屏障、性能分析与调试等。
+
+# **2 Source Code Analysis**
 
 TO BE CONTINUED...
-
-document.getElementById('myDiv').innerHTML = '<a href="https://example.com">Click Here</a>';
 
 <style class="fallback">body{visibility:hidden}</style>
 <script>markdeepOptions={tocStyle:'long',tocMaxLevel:3};</script>
